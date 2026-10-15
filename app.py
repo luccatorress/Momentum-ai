@@ -213,7 +213,7 @@ def signed_demo_request(method: str, path: str, params: dict):
         raise HTTPException(status_code=502, detail=f"Falha na API Binance Demo: {type(e).__name__}")
 
 class AnalyzeRequest(BaseModel):
-    asset: Literal["BTC/USDT","ETH/USDT","BNB/USDT"] = "BTC/USD"
+    asset: Literal["BTC/USDT","ETH/USDT","BNB/USDT"] = "BTC/USDT"
     timeframe: Literal["1 min","5 min","15 min"] = "5 min"
     strategy: Literal["Momentum","Confluência","Tendência"] = "Momentum"
 
