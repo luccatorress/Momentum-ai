@@ -5,8 +5,10 @@ from fastapi.responses import JSONResponse
 import os, secrets, base64
 from pydantic import BaseModel, Field
 from typing import Literal
-import random, math, time, hmac, hashlib, urllib.parse
+import random, math, time, hmac, hashlib, urllib.parse, logging
 import httpx
+
+logger = logging.getLogger("momentum_ai")
 
 app = FastAPI(title="Momentum AI", version="0.2.0")
 
@@ -126,39 +128,97 @@ def analyze(asset, timeframe, strategy):
     }
 
 
-BINANCE_PUBLIC_BASE = "https://api.binance.com"
+# Endpoints oficiais de dados públicos da Binance. O último é dedicado a market data.
+BINANCE_PUBLIC_BASES = (
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://data-api.binance.vision",
+)
+BINANCE_PUBLIC_BASE = BINANCE_PUBLIC_BASES[0]
 BINANCE_DEMO_BASE = "https://demo-api.binance.com"
 
+
 def binance_public_candles(symbol: str, interval: str, limit: int = 120):
-    # Real public market data. No API key is needed for public klines.
-    response = httpx.get(
-        f"{BINANCE_PUBLIC_BASE}/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
-        timeout=10.0,
-    )
-    response.raise_for_status()
-    rows = response.json()
-    return [{
-        "t": int(row[0]),
-        "open": float(row[1]),
-        "high": float(row[2]),
-        "low": float(row[3]),
-        "close": float(row[4]),
-        "volume": float(row[5]),
-    } for row in rows]
+    """Obtém klines públicos, tentando endpoints oficiais alternativos."""
+    if not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("O limite de candles deve estar entre 1 e 1000.")
+
+    errors = []
+    for base_url in BINANCE_PUBLIC_BASES:
+        try:
+            response = httpx.get(
+                f"{base_url}/api/v3/klines",
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=httpx.Timeout(8.0, connect=4.0),
+                follow_redirects=True,
+            )
+            if response.status_code >= 400:
+                body = response.text[:180].replace("\\n", " ")
+                errors.append(f"{base_url}: HTTP {response.status_code} {body}")
+                # 400/404 geralmente indicam símbolo ou parâmetros inválidos.
+                # 403/418/429/451 podem ser específicos de um endpoint/IP, então tentamos outro host.
+                if response.status_code in (400, 404, 422):
+                    break
+                continue
+
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                errors.append(f"{base_url}: resposta JSON vazia ou inesperada")
+                continue
+
+            candles = []
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    raise ValueError("Formato de candle inesperado retornado pela Binance.")
+                candle = {
+                    "t": int(row[0]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+                if not all(math.isfinite(candle[k]) for k in ("open", "high", "low", "close", "volume")):
+                    raise ValueError("A Binance retornou valores numéricos inválidos.")
+                candles.append(candle)
+
+            if len(candles) < 51:
+                raise ValueError(f"A Binance retornou apenas {len(candles)} candles; são necessários pelo menos 51.")
+            return candles
+
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
+            errors.append(f"{base_url}: {type(exc).__name__}: {str(exc)[:160]}")
+            logger.warning("Falha no endpoint público Binance %s: %s: %s",
+                           base_url, type(exc).__name__, str(exc)[:160])
+
+    summary = " | ".join(errors[-3:]) or "Nenhum endpoint retornou dados válidos."
+    logger.error("Todos os endpoints públicos da Binance falharam para %s %s: %s",
+                 symbol, interval, summary)
+    raise RuntimeError(f"Não foi possível obter candles da Binance. {summary}")
+
 
 def market_candles(asset: str, timeframe: str, limit: int = 120):
-    symbol = {"BTC/USDT":"BTCUSDT", "ETH/USDT":"ETHUSDT", "BNB/USDT":"BNBUSDT"}.get(asset)
-    interval = {"1 min":"1m", "5 min":"5m", "15 min":"15m"}.get(timeframe, "5m")
+    symbol = {"BTC/USDT": "BTCUSDT", "ETH/USDT": "ETHUSDT", "BNB/USDT": "BNBUSDT"}.get(asset)
+    interval = {"1 min": "1m", "5 min": "5m", "15 min": "15m"}.get(timeframe)
     if not symbol:
         raise HTTPException(status_code=400, detail="Ativo não suportado.")
+    if not interval:
+        raise HTTPException(status_code=400, detail="Período não suportado.")
     try:
         return binance_public_candles(symbol, interval, limit)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao obter candles públicos da Binance: {type(e).__name__}")
+    except Exception as exc:
+        logger.exception("Falha ao obter candles públicos da Binance (asset=%s, timeframe=%s)", asset, timeframe)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha ao obter dados públicos da Binance: {type(exc).__name__}: {str(exc)[:350]}"
+        ) from exc
 
 def analyze_real_market(asset: str, timeframe: str, strategy: str):
     candles = market_candles(asset, timeframe, 120)
+    if len(candles) < 51:
+        raise HTTPException(status_code=502, detail="Dados insuficientes da Binance para calcular os indicadores.")
     closes = [c["close"] for c in candles]
     e9, e21, e50 = ema(closes,9), ema(closes,21), ema(closes,50)
     macd_line = [a-b for a,b in zip(ema(closes,12), ema(closes,26))]
